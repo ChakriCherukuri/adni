@@ -223,3 +223,210 @@ For each subject:
 ---
 
 If you tell me whether you consider the **first AD-labeled scan** as the conversion time (common) or you want something like “midpoint between last MCI and first AD”, I can recommend the cleanest convention and how to keep it consistent across subjects.
+
+
+Perfect — that’s the **cleanest and most defensible choice**, and it’s exactly what most ADNI survival papers do.
+
+Below I’ll lock that choice in and give you a **precise, unambiguous labeling rule** you can implement and cite, plus a couple of sanity checks so you don’t accidentally leak information.
+
+---
+
+## Final label definition (locked)
+
+### Conversion time definition
+
+> **Conversion time = datetime of the first scan labeled AD after baseline MCI**
+
+No midpoint, no interpolation.
+
+---
+
+## Step-by-step label construction (implementation-ready)
+
+For **each subject**:
+
+### 1) Sort visits
+
+Sort all visits by `acq_datetime` (parsed from folder name or JSON).
+
+---
+
+### 2) Define baseline (time = 0)
+
+* Baseline = **earliest scan labeled MCI**
+* Denote its datetime as:
+
+```text
+mci_bl_datetime
+```
+
+**Exclusion rule**
+
+* If subject has **no MCI scan**, exclude from this study.
+* If subject has AD before their first MCI, exclude (or treat separately, but do not include here).
+
+---
+
+### 3) Define conversion event
+
+* Find the **first scan strictly after baseline** where label == AD.
+* If found:
+
+  * `event_observed = 1`
+  * `event_datetime = datetime_of_first_AD_scan`
+* Else:
+
+  * `event_observed = 0`
+  * `event_datetime = null`
+
+---
+
+### 4) Define censoring time
+
+* If `event_observed == 1`:
+
+  * `censor_datetime = event_datetime`
+* Else:
+
+  * `censor_datetime = datetime_of_last_available_scan`
+
+---
+
+### 5) Compute survival time
+
+```text
+event_time_years =
+    (censor_datetime - mci_bl_datetime).total_seconds()
+    / (365.25 * 24 * 3600)
+```
+
+This definition ensures:
+
+* Converters: time = MCI → first AD
+* Non-converters: time = MCI → last observed scan (right-censored)
+
+---
+
+### 6) Optional AFT labels (if you use XGBoost AFT)
+
+```text
+aft_y_lower = event_time_years
+aft_y_upper =
+    event_time_years      if event_observed == 1
+    +infinity             if event_observed == 0
+```
+
+---
+
+## Leakage-safe feature usage (important)
+
+Because you’ve defined conversion time as the **first AD scan**, the feature rule becomes very clean:
+
+### Allowed scans for feature extraction
+
+* **Converters**: use only scans with
+
+  ```text
+  acq_datetime ≤ event_datetime
+  ```
+* **Censored subjects**: use all scans up to last scan
+
+This is consistent with:
+
+> “At the moment the subject is diagnosed as AD, what information was available?”
+
+You are *not* using future scans beyond diagnosis.
+
+---
+
+## Special edge cases & how to handle them
+
+### Case 1: MCI → AD → MCI → AD
+
+Very common in ADNI due to diagnostic noise.
+
+**Rule (recommended)**
+
+* **First AD locks the event**
+* Ignore any later MCI reversion
+
+This aligns with clinical practice and avoids ambiguous survival times.
+
+---
+
+### Case 2: AD at baseline
+
+* Exclude from this study (not an MCI→AD progression problem).
+
+---
+
+### Case 3: Single MCI scan, no follow-up
+
+* Valid censored subject
+* `event_observed = 0`
+* `event_time_years ≈ 0`
+* Keep, but note these add limited information.
+
+---
+
+## Is this classification or regression? (final answer)
+
+### Training problem
+
+You are solving a **right-censored survival analysis problem**.
+
+Formally:
+
+* Target = `(event_time_years, event_observed)`
+* This is **neither standard classification nor standard regression**.
+
+### What XGBoost is doing
+
+If you use:
+
+* `objective = "survival:cox"` → proportional hazards model
+* `objective = "survival:aft"` → accelerated failure time model
+
+XGBoost learns:
+
+* A **risk function over time**, not a hard label
+
+---
+
+## How to get a binary answer (if needed later)
+
+After training, you can derive:
+
+* Probability of conversion **within T years** (e.g. 24 months)
+* Or risk score → threshold → binary decision
+
+But that’s **post-hoc** and does not change how you train.
+
+---
+
+## Minimal checklist before you train
+
+Before fitting the model, verify:
+
+* [ ] Each subject has exactly **one row**
+* [ ] `event_time_years > 0` for all subjects
+* [ ] No features use scans **after** `event_datetime`
+* [ ] Train/val/test split is **subject-level**
+* [ ] Stratify splits by `event_observed` (and optionally site)
+
+---
+
+## Why this setup is scientifically strong
+
+* Matches ADNI conventions
+* Handles censored stable-MCI subjects correctly
+* Avoids “stable MCI = negative forever” fallacy
+* Produces time-dependent risk estimates
+* Cleanly extensible to deep longitudinal models later
+
+If you want, next I can:
+
+* suggest **XGBoost survival hyperparameters** that work well at N≈400,
+* show how to **evaluate** (C-index, time-dependent AUC),
+* or sketch a **code template** that builds these labels directly from your folder structure.
+
