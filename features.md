@@ -430,3 +430,296 @@ If you want, next I can:
 * show how to **evaluate** (C-index, time-dependent AUC),
 * or sketch a **code template** that builds these labels directly from your folder structure.
 
+Great questions — this is exactly the right moment to pause and get the concepts **rock-solid**. Survival analysis *looks* confusing at first because it doesn’t fit the usual “one y per row” mental model, but once the intuition clicks, it’s actually very clean.
+
+I’ll answer your three questions **in order**, with concrete ADNI examples and minimal math.
+
+---
+
+# 1) What is **censoring**?
+
+### Plain-English definition
+
+**Censoring means you don’t know the true outcome time — only that it hasn’t happened yet (up to a point).**
+
+In your ADNI project:
+
+* Some MCI subjects **convert to AD** during the study
+  → you know *when* conversion happened.
+* Some MCI subjects **do not convert** before the study ends
+  → you **do not know** when (or if) they will convert in the future.
+
+Those second subjects are **right-censored**.
+
+---
+
+### Concrete ADNI example
+
+| Subject | What you observe                  | What you *don’t* know                  |
+| ------- | --------------------------------- | -------------------------------------- |
+| A       | Converts to AD at year 2.3        | Nothing missing                        |
+| B       | Followed for 4.1 years, still MCI | Will they convert at year 5? 8? Never? |
+
+Subject B is **censored at 4.1 years**.
+
+---
+
+### Why classification fails here
+
+If you do binary classification:
+
+| Subject | Label            |
+| ------- | ---------------- |
+| A       | 1 (converter)    |
+| B       | 0 (stable MCI) ❌ |
+
+This assumes B is *truly* negative forever — which is wrong.
+They’re only “negative **so far**”.
+
+Survival analysis fixes this by saying:
+
+> “B survived (remained MCI) **at least** 4.1 years.”
+
+That’s censoring.
+
+---
+
+### Key rule
+
+* **Event observed** → exact time known
+* **Censored** → event time unknown, but **greater than last follow-up**
+
+---
+
+# 2) What is **AFT**?
+
+AFT = **Accelerated Failure Time** model.
+
+Think of survival models as answering one of two questions:
+
+---
+
+## Two ways to model time-to-event
+
+### A) Cox model (most common)
+
+> “How does a feature **change the risk** of converting at any moment?”
+
+* Outputs a **risk score**
+* Relative: “twice the risk”, “half the risk”
+* Does **not** directly predict time
+
+This is `survival:cox` in XGBoost.
+
+---
+
+### B) AFT model (more intuitive)
+
+> “How do features **speed up or slow down the clock** until conversion?”
+
+* Directly models **time to AD**
+* Example interpretation:
+
+  > “Smaller hippocampus → conversion happens sooner”
+
+This is `survival:aft` in XGBoost.
+
+---
+
+### Why AFT is nice for you
+
+* You can think of it as **regression on time**
+* But it **correctly handles censored data**
+* Output can be turned into:
+
+  * expected time to conversion
+  * probability of converting within N years
+
+---
+
+### Why AFT needs *two* numbers (this matters for Q3)
+
+For censored subjects:
+
+* You **don’t know** the exact conversion time
+* You only know:
+
+  ```text
+  true_time > last_followup_time
+  ```
+
+So AFT models accept **intervals**:
+
+| Subject   | True time lies in |
+| --------- | ----------------- |
+| Converter | [2.3, 2.3]        |
+| Censored  | [4.1, +∞)         |
+
+That’s why you give **lower and upper bounds**.
+
+---
+
+# 3) “Two labels?? I only know regression & classification”
+
+This is the key confusion — and it’s a *very* common one.
+
+### Short answer
+
+> **You are not predicting two labels.**
+> You are predicting **one thing: time to AD**, but some times are unknown.
+
+The “two labels” are just **how we describe uncertainty** during training.
+
+---
+
+## The survival label is NOT two outputs
+
+You are **not** training the model to predict:
+
+```text
+(y1, y2)
+```
+
+Instead, you are telling the model:
+
+> “The true time lies in this interval.”
+
+---
+
+## Think of it this way (analogy)
+
+### Ordinary regression
+
+```text
+y = 2.3 years
+```
+
+### Censored regression
+
+```text
+y > 4.1 years
+```
+
+AFT needs a way to express both cases **numerically**.
+
+So we encode:
+
+| Case           | Lower bound | Upper bound |
+| -------------- | ----------- | ----------- |
+| Event observed | 2.3         | 2.3         |
+| Censored       | 4.1         | +∞          |
+
+That’s it.
+
+---
+
+## What the model actually predicts
+
+The model predicts **one value per subject**:
+
+* A latent time-to-event distribution
+* Or a point estimate of log(time)
+
+It is **not predicting two numbers**.
+
+---
+
+## How XGBoost uses this (very concrete)
+
+For AFT in XGBoost:
+
+You pass:
+
+```python
+y_lower = [2.3, 4.1, 1.8, ...]
+y_upper = [2.3, inf, 1.8, ...]
+```
+
+Internally, XGBoost:
+
+* treats exact times as exact
+* treats censored ones as “greater than”
+
+During prediction:
+
+```python
+pred = model.predict(X)
+```
+
+You get:
+
+* a **single prediction per subject**
+
+---
+
+## If this still feels weird, use this mental model
+
+### Survival analysis = regression with missing targets
+
+But:
+
+* missingness is **structured**
+* “missing” means “greater than this value”
+
+Classification throws away that information. Survival keeps it.
+
+---
+
+## Mapping to what you already know
+
+| You know             | Survival equivalent        |
+| -------------------- | -------------------------- |
+| Regression           | AFT (with censoring)       |
+| Classification       | Discrete-time hazard model |
+| Label = y            | Label = (time, event)      |
+| Missing y → drop row | Missing y → censored       |
+
+---
+
+## Minimal example with your ADNI setup
+
+### Your table (one row per subject)
+
+| subject | event_observed | event_time_years |
+| ------- | -------------- | ---------------- |
+| S1      | 1              | 2.3              |
+| S2      | 0              | 4.1              |
+| S3      | 1              | 1.6              |
+
+### AFT encoding
+
+| subject | y_lower | y_upper |
+| ------- | ------- | ------- |
+| S1      | 2.3     | 2.3     |
+| S2      | 4.1     | +∞      |
+| S3      | 1.6     | 1.6     |
+
+### Prediction
+
+```text
+model(X) → predicted_time_or_distribution
+```
+
+Still **one prediction per subject**.
+
+---
+
+## Final intuition checkpoint (important)
+
+* You are predicting **when** AD happens
+* Some people haven’t reached AD yet
+* You must not pretend they never will
+* Survival analysis lets you say:
+
+  > “At least this long, maybe longer”
+
+That’s censoring, and that’s why the labels look different.
+
+---
+
+If you want, next I can:
+
+* walk through a **toy 5-subject example with numbers**,
+* show **exact XGBoost code** for Cox vs AFT,
+* or show how to convert survival predictions into
+  **“probability of AD within 2 years”**, which often makes everything click.
